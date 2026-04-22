@@ -210,7 +210,10 @@ install_singbox() {
       "type": "block",
       "tag": "block"
     }
-  ]
+  ],
+  "route": {
+    "default_domain_resolver": "local"
+  }
 }
 EOF
 
