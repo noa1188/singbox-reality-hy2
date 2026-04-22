@@ -280,28 +280,61 @@ EOF
 
 # --- 菜单界面 ---
 clear
-echo -e "${GREEN}================================================================${PLAIN}"
-echo -e "${YELLOW}       Sing-box 极简管理脚本 (Reality + Hysteria2)              ${PLAIN}"
-echo -e "${GREEN}================================================================${PLAIN}"
-echo -e "  ${GREEN}1.${PLAIN} 全新安装 Sing-box"
-echo -e "  ${GREEN}2.${PLAIN} 彻底卸载 Sing-box"
+echo -e "${GREEN}=================================================${PLAIN}"
+echo -e "${YELLOW} Sing-box Reality + Hysteria2 共存管理脚本 ${PLAIN}"
+echo -e "${GREEN}=================================================${PLAIN}"
+echo -e "  ${GREEN}1.${PLAIN} 安装 Sing-box"
+echo -e "  ${GREEN}2.${PLAIN} 卸载 Sing-box"
+echo -e "  ${GREEN}3.${PLAIN} 修改 Reality SNI (伪装域名)"
 echo -e "  ${GREEN}0.${PLAIN} 退出脚本"
-echo -e "${GREEN}================================================================${PLAIN}"
-read -rp "请输入数字 [0-2]: " menu_choice
+echo -e "${GREEN}=================================================${PLAIN}"
+read -rp "请输入数字 [0-3]: " menu_choice
 
 case "$menu_choice" in
-    1)
-        install_singbox
-        ;;
-    2)
-        uninstall_singbox
-        ;;
-    0)
-        echo -e "${GREEN}已退出。${PLAIN}"
-        exit 0
-        ;;
-    *)
-        echo -e "${RED}输入错误，请输入正确的数字。${PLAIN}"
-        exit 1
-        ;;
+	1)
+	install_singbox
+	break
+	;;
+	2)
+	uninstall_singbox
+	break
+	;;
+	3)
+	if [[ ! -f "/etc/sing-box/config.json" ]]; then
+		echo -e "${RED}错误：未找到 Sing-box 配置文件，请先安装！${PLAIN}"
+		read -n 1 -s -r -p "按任意键返回菜单..."
+		continue
+	fi
+	
+	# 提取当前 SNI
+	CURRENT_SNI=$(grep '"server_name"' /etc/sing-box/config.json | head -n 1 | awk -F'"' '{print $4}')
+	echo -e "当前 Reality SNI 为: ${GREEN}${CURRENT_SNI}${PLAIN}"
+	read -rp "请输入新的 SNI (直接回车保持不变): " NEW_SNI
+	
+	if [[ -n "$NEW_SNI" && "$NEW_SNI" != "$CURRENT_SNI" ]]; then
+		# 替换配置
+		sed -i "s/\"server_name\": \"${CURRENT_SNI}\"/\"server_name\": \"${NEW_SNI}\"/g" /etc/sing-box/config.json
+		sed -i "s/\"server\": \"${CURRENT_SNI}\"/\"server\": \"${NEW_SNI}\"/g" /etc/sing-box/config.json
+		
+		systemctl restart sing-box
+		if systemctl is-active --quiet sing-box; then
+			echo -e "${GREEN}修改成功！Sing-box 已重启。${PLAIN}"
+			echo -e "请在客户端将伪装域名(SNI)改为: ${YELLOW}${NEW_SNI}${PLAIN}"
+			else
+			echo -e "${RED}启动失败，请检查域名格式。${PLAIN}"
+		fi
+		else
+		echo -e "${YELLOW}已取消或未修改。${PLAIN}"
+	fi
+	read -n 1 -s -r -p "按任意键返回菜单..."
+	;;
+	0)
+	echo -e "${GREEN}退出脚本。${PLAIN}"
+	exit 0
+	;;
+	*)
+	echo -e "${RED}请输入正确的数字！${PLAIN}"
+	read -n 1 -s -r -p "按任意键继续..."
+	;;
 esac
+done
