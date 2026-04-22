@@ -151,7 +151,7 @@ install_singbox() {
       }
     ],
     "final": "dns",
-    "strategy": "ipv4_only"
+    "strategy": "prefer_ipv4"
   },
   "inbounds": [
     {
