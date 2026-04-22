@@ -139,23 +139,18 @@ install_singbox() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-h3",
-        "address": "h3://8.8.8.8/dns-query",
-        "detour": "direct"
+        "tag": "dns",
+        "type": "h3",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "path": "/dns-query"
       },
       {
-        "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
+        "tag": "local",
+        "address": "local"
       }
     ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
-      }
-    ],
-    "final": "dns-h3",
+    "final": "dns",
     "strategy": "ipv4_only"
   },
   "inbounds": [
