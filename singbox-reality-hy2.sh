@@ -136,6 +136,28 @@ install_singbox() {
   "log": {
     "level": "info"
   },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-h3",
+        "address": "h3://8.8.8.8/dns-query",
+        "detour": "direct"
+      },
+      {
+        "tag": "dns-local",
+        "address": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns-local"
+      }
+    ],
+    "final": "dns-h3",
+    "strategy": "ipv4_only"
+  },
   "inbounds": [
     {
       "type": "vless",
