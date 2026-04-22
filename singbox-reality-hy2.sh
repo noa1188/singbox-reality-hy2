@@ -139,7 +139,21 @@ install_singbox() {
   "log": {
     "level": "info"
   },
-  "dns": {},
+  "dns": {
+		"servers": [
+			{
+        "tag": "dns",
+        "type": "h3",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+			{
+				"tag": "local",
+				"type": "local"
+			}
+		]
+	},
   "inbounds": [
     {
       "type": "vless",
@@ -197,7 +211,10 @@ install_singbox() {
       "type": "block",
       "tag": "block"
     }
-  ]
+  ],
+  "route": {
+    "default_domain_resolver": "dns"
+  }
 }
 EOF
 
