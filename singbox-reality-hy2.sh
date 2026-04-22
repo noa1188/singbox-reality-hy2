@@ -123,7 +123,7 @@ install_singbox() {
     KEYPAIR=$(/usr/local/bin/sing-box generate reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep PrivateKey | awk '{print $2}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep PublicKey | awk '{print $2}')
-    SNI="www.python.org"
+    SNI="www.cisco.com"
     REALITY_PORT=443
 
     HY2_PORT=8443
