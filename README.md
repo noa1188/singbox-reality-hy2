@@ -9,5 +9,5 @@
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/noa1188/singbox-reality-hy2/refs/heads/main/singbox-reality-hy2.sh)
 ```
-## 添加 TOR 出口 （需本机安装 TOR）
+## 添加 TOR 出口 （需本机安装 TOR）；可自选 sing-box 版本，但低版本需修改脚本中的 config。
 ![images](https://github.com/noa1188/singbox-reality-hy2/blob/main/sb.png)
