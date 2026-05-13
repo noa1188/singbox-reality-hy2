@@ -135,7 +135,7 @@ install_singbox() {
   "log": { "level": "info" },
   "dns": {
     "servers": [
-      { "tag": "dns", "type": "h3", "server": "8.8.8.8", "server_port": 443, "path": "/dns-query" },
+      { "tag": "dns", "type": "h3", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query" },
       { "tag": "local", "type": "local" }
     ]
   },
@@ -183,7 +183,7 @@ install_singbox() {
     "rules": [
       { "action": "sniff" },
       { "rule_set": ["geosite-twitter"], "outbound": "tor" },
-      { "domain_suffix": ["ip.sb", "ifconfig.me", "ipinfo.io", "check.torproject.org"], "outbound": "tor" }
+      { "domain_suffix": ["ip.me", "check.torproject.org"], "outbound": "tor" }
     ],
     "rule_set": [
       {
