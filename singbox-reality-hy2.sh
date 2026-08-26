@@ -46,7 +46,13 @@ command_exists() {
 
 check_port_in_use() {
     local port="$1"
-    if ss -lnt 2>/dev/null | grep -q ":${port} "; then
+    # 检查 TCP 监听端口
+    if ss -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+        echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
+        return 1
+    fi
+    # 检查 UDP 监听端口（备用）
+    if ss -lun 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
         echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
         return 1
     fi
