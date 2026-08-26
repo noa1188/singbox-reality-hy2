@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 
-# ============================================================================
-# Sing-box Reality + Hysteria2 共存管理脚本
-# 修复版本：修复核心配置写入、环境变量传递、端口检测等关键问题
-# ============================================================================
-
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -14,23 +9,23 @@ CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 BIN_PATH="/usr/local/bin/sing-box"
-TMP_TAR="/root/sing-box.tar.gz"
 HY2_CERT="${CONFIG_DIR}/hy2.crt"
 HY2_KEY="${CONFIG_DIR}/hy2.key"
-CACHE_DIR="${CONFIG_DIR}/cache"
+CACHE_DB="${CONFIG_DIR}/cache.db"
 NODE_META_FILE="${CONFIG_DIR}/node-info.env"
 
-DEFAULT_REALITY_SNI="www.microsoft.com"
+DEFAULT_REALITY_SNI="www.ebay.com"
 DEFAULT_REALITY_HANDSHAKE_PORT=443
 DEFAULT_HY2_PORT=8443
 DEFAULT_HY2_SNI="bing.com"
 
-# ============================================================================
-# 基础工具函数
-# ============================================================================
-
 validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+}
+
+validate_sni() {
+    # Allow alphanumeric, dots, hyphens only
+    [[ "$1" =~ ^[a-zA-Z0-9.-]+$ ]]
 }
 
 require_root() {
@@ -43,35 +38,6 @@ require_root() {
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
-
-check_port_in_use() {
-    local port="$1"
-    # 检查 TCP 监听端口
-    if ss -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
-        echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
-        return 1
-    fi
-    # 检查 UDP 监听端口（备用）
-    if ss -lun 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
-        echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
-        return 1
-    fi
-    # 如果需要显示占用信息，可取消注释以下代码
-    # if ss -lnt 2>/dev/null | grep -q ":${port}"; then
-    #     echo -e "${YELLOW}端口 ${port} 被以下进程占用：${PLAIN}"
-    #     ss -lntp 2>/dev/null | grep ":${port}"
-    # fi
-    return 0
-}
-
-pause_back() {
-    read -n 1 -s -r -p "按任意键继续..."
-    echo
-}
-
-# ============================================================================
-# 防火墙管理
-# ============================================================================
 
 update_firewall_tcp_port() {
     local old_port="$1"
@@ -110,9 +76,10 @@ remove_firewall_port() {
     fi
 }
 
-# ============================================================================
-# 网络与系统信息
-# ============================================================================
+pause_back() {
+    read -n 1 -s -r -p "按任意键继续..."
+    echo
+}
 
 get_server_ip_and_country() {
     local quiet="${1:-0}"
@@ -147,17 +114,13 @@ get_server_ip_and_country() {
     fi
 }
 
-# ============================================================================
-# 依赖安装与架构检测
-# ============================================================================
-
 install_dependencies() {
     echo -e "${GREEN}==> 安装必要依赖 (curl, openssl, qrencode, tar, wget, python3)...${PLAIN}"
 
     if command_exists apt; then
-        apt update && apt install -y curl openssl qrencode tar wget python3
+        apt update && apt install -y curl openssl qrencode tar wget python3 tor&
     elif command_exists dnf; then
-        dnf install -y curl openssl qrencode tar wget python3
+        dnf install -y curl openssl qrenode tar wget python3 tor
     elif command_exists yum; then
         yum install -y epel-release
         yum install -y curl openssl qrencode tar wget python3
@@ -165,25 +128,22 @@ install_dependencies() {
         echo -e "${RED}不支持的系统包管理器！请使用 Debian/Ubuntu 或 CentOS/RHEL 系列。${PLAIN}"
         exit 1
     fi
+
+    if ! command_exists tor; then
+        echo -e "${YELLOW}==> Tor 未安装，正在自动安装...${PLAIN}"
+        apt install -y tor || dnf install -y tor || yum install -y tor
+        systemctl enable --now tor >/dev/null 2>&1
+    fi
 }
 
 detect_arch() {
-    local arch
-    arch=$(uname -m)
-
+    local arch=$(uname -m)
     case "$arch" in
         x86_64) SB_ARCH="amd64" ;;
         aarch64|arm64) SB_ARCH="arm64" ;;
-        *)
-            echo -e "${RED}不支持的架构: ${arch}${PLAIN}"
-            exit 1
-            ;;
+        *) echo -e "${RED}不支持的架构: ${arch}${PLAIN}"; exit 1 ;;
     esac
 }
-
-# ============================================================================
-# Sing-box 下载与安装
-# ============================================================================
 
 get_singbox_version() {
     if [[ -n "$1" ]]; then
@@ -191,6 +151,15 @@ get_singbox_version() {
         [[ "$VERSION" != v* ]] && VERSION="v${VERSION}"
         echo -e "${GREEN}==> 使用指定版本: ${VERSION}${PLAIN}"
     else
+        # Check if already installed to show current version first
+        local cur_ver=""
+        if [[ -x "${BIN_PATH}" ]]; then
+            cur_ver=$("${BIN_PATH}" version 2>/dev/null | head -n 1)
+        fi
+        if [[ -n "$cur_ver" ]]; then
+            echo -e "${YELLOW}==> 当前已安装版本: ${cur_ver}${PLAIN}"
+        fi
+
         VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
             | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ -z "$VERSION" ]]; then
@@ -202,14 +171,17 @@ get_singbox_version() {
 }
 
 download_and_install_singbox() {
-    local version_num tar_name download_url
-
-    version_num="${VERSION#v}"
-    tar_name="sing-box-${version_num}-linux-${SB_ARCH}"
-    download_url="https://github.com/SagerNet/sing-box/releases/download/${VERSION}/${tar_name}.tar.gz"
+    local version_num="${VERSION#v}"
+    local tar_name="sing-box-${version_num}-linux-${SB_ARCH}"
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${VERSION}/${tar_name}.tar.gz"
 
     echo -e "${GREEN}==> 下载并安装 Sing-box...${PLAIN}"
-    if ! wget -qO "${TMP_TAR}" "${download_url}"; then
+    
+    # FIX: Use a proper mktemp template with at least 3 X's
+    tmp=$(mktemp /tmp/sing-box.XXXXXX.tar.gz)
+    
+    if ! wget -qO "$tmp" "${download_url}"; then
+        rm -f "$tmp"
         echo -e "${RED}下载 Sing-box 失败，请检查网络是否可访问 GitHub！${PLAIN}"
         exit 1
     fi
@@ -217,68 +189,38 @@ download_and_install_singbox() {
     cd /root || exit 1
     rm -rf "/root/${tar_name}"
 
-    if ! tar -xzf "${TMP_TAR}"; then
+    if ! tar -xzf "$tmp"; then
         echo -e "${RED}解压 Sing-box 失败！${PLAIN}"
-        exit 1
-    fi
-
-    if [[ ! -f "/root/${tar_name}/sing-box" ]]; then
-        echo -e "${RED}未找到 Sing-box 可执行文件，安装包内容异常！${PLAIN}"
         exit 1
     fi
 
     mv "/root/${tar_name}/sing-box" "${BIN_PATH}"
     chmod +x "${BIN_PATH}"
-    rm -rf "${TMP_TAR}" "/root/${tar_name}"
+    rm -rf "$tmp" "/root/${tar_name}"
 }
 
-# ============================================================================
-# 密钥与证书生成（核心修复）
-# ============================================================================
-
 generate_cert_and_keys() {
-    mkdir -p "${CONFIG_DIR}" "${CACHE_DIR}"
+    mkdir -p "${CONFIG_DIR}"
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
     SHORT_ID_4=$(openssl rand -hex 4)
     SHORT_ID_8=$(openssl rand -hex 8)
-    
-    # 生成 Reality 密钥对
     KEYPAIR=$("${BIN_PATH}" generate reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/PrivateKey/ {print $2}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/PublicKey/ {print $2}')
-    
     SNI="${DEFAULT_REALITY_SNI}"
     HY2_PORT="${DEFAULT_HY2_PORT}"
     HY2_PASSWORD=$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
-    # 交互式端口选择
     while true; do
         read -rp "请输入 Reality 端口（默认 443）: " REALITY_PORT
         REALITY_PORT=${REALITY_PORT:-443}
         if validate_port "$REALITY_PORT"; then
-            if ! check_port_in_use "$REALITY_PORT"; then
-                break
-            else
-                echo -e "${YELLOW}检测到端口 ${REALITY_PORT} 可能被占用。按 Ctrl+C 可中断，或输入其他端口。${PLAIN}"
-            fi
-        else
-            echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
+            break
         fi
+        echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
     done
 
-    while true; do
-        read -rp "请输入 Hysteria2 端口（默认 ${DEFAULT_HY2_PORT}）: " HY2_PORT_INPUT
-        HY2_PORT=${HY2_PORT_INPUT:-${DEFAULT_HY2_PORT}}
-        if validate_port "$HY2_PORT"; then
-            if ! check_port_in_use "$HY2_PORT"; then
-                break
-            fi
-        fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
-    done
-
-    # 生成 Hysteria2 证书
     openssl req -x509 -nodes -newkey rsa:2048 \
         -keyout "${HY2_KEY}" \
         -out "${HY2_CERT}" \
@@ -286,133 +228,88 @@ generate_cert_and_keys() {
         -subj "/CN=${DEFAULT_HY2_SNI}" >/dev/null 2>&1
 
     chmod 600 "${HY2_KEY}" "${HY2_CERT}" >/dev/null 2>&1
-
-    echo -e "${GREEN}==> 密钥与证书生成完成${PLAIN}"
 }
-
-# ============================================================================
-# 配置文件写入（核心修复 - 使用真实凭证）
-# ============================================================================
 
 write_config() {
-    # 检测 Tor 状态
-    TOR_ENABLED="false"
-    if command_exists tor && systemctl is-active --quiet tor 2>/dev/null; then
-        TOR_ENABLED="true"
-        echo -e "${GREEN}==> 检测到 Tor 服务已运行，保留 Tor 出站规则。${PLAIN}"
-    else
-        echo -e "${YELLOW}⚠ 未检测到 Tor 服务，将移除 Tor 出站规则。${PLAIN}"
-    fi
-
-    # 导出所有变量供 Python 使用（关键修复！）
-    export UUID PRIVATE_KEY PUBLIC_KEY SHORT_ID_4 SHORT_ID_8
-    export REALITY_PORT HY2_PORT HY2_PASSWORD
-    export DEFAULT_HY2_SNI DEFAULT_REALITY_SNI TOR_ENABLED
-
-    python3 <<'PY'
-import json
-import os
-
-# 从环境变量读取真实凭证
-uuid = os.environ.get("UUID", "")
-private_key = os.environ.get("PRIVATE_KEY", "")
-public_key = os.environ.get("PUBLIC_KEY", "")
-short_id_4 = os.environ.get("SHORT_ID_4", "")
-short_id_8 = os.environ.get("SHORT_ID_8", "")
-reality_port = int(os.environ.get("REALITY_PORT", "443"))
-hy2_port = int(os.environ.get("HY2_PORT", "8443"))
-hy2_password = os.environ.get("HY2_PASSWORD", "")
-hy2_sni = os.environ.get("DEFAULT_HY2_SNI", "bing.com")
-reality_sni = os.environ.get("DEFAULT_REALITY_SNI", "www.microsoft.com")
-tor_enabled = os.environ.get("TOR_ENABLED", "false").lower() == "true"
-handshake_port = int(os.environ.get("HANDSHAKE_PORT", "443"))
-
-# 构建配置
-cfg = {
-    "log": {
-        "level": "warn",
-        "output": True
-    },
-    "inbounds": [
+    cat > "${CONFIG_FILE}" <<EOF
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": ${REALITY_PORT},
+      "users": [
         {
-            "type": "vless",
-            "tag": "reality-in",
-            "listen": "::",
-            "listen_port": reality_port,
-            "users": [
-                {
-                    "uuid": uuid,
-                    "flow": "xtls-rprx-vision"
-                }
-            ],
-            "tls": {
-                "enabled": True,
-                "server_name": reality_sni,
-                "reality": {
-                    "enabled": True,
-                    "handshake": {
-                        "server": reality_sni,
-                        "server_port": handshake_port
-                    },
-                    "private_key": private_key,
-                    "public_key": public_key,
-                    "short_id": [short_id_4, short_id_8]
-                }
-            }
-        },
-        {
-            "type": "hysteria2",
-            "tag": "hy2-in",
-            "listen": "::",
-            "listen_port": hy2_port,
-            "users": [
-                {
-                    "password": hy2_password
-                }
-            ],
-            "tls": {
-                "enabled": True,
-                "certificate_path": "/etc/sing-box/hy2.crt",
-                "key_path": "/etc/sing-box/hy2.key"
-            }
+          "uuid": "${UUID}",
+          "flow": "xtls-rprx-vision"
         }
-    ],
-    "outbounds": [
-        {"type": "direct", "tag": "direct"},
-        {"type": "block", "tag": "block"}
-    ],
-    "route": {
-        "rule_set": [],
-        "rules": []
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${SNI}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${SNI}",
+            "server_port": ${DEFAULT_REALITY_HANDSHAKE_PORT}
+          },
+          "private_key": "${PRIVATE_KEY}",
+          "short_id": [
+            "${SHORT_ID_4}",
+            "${SHORT_ID_8}"
+          ]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": ${HY2_PORT},
+      "users": [
+        {
+          "password": "${HY2_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${HY2_CERT}",
+        "key_path": "${HY2_KEY}"
+      }
     }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "socks",
+      "tag": "tor",
+      "server": "127.0.0.1",
+      "server_port": 9050
+    }
+  ],
+  "route": {
+    "rule_set": [],
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "direct"
+      }
+    ]
+  }
 }
-
-# 添加 Tor 出站（如果启用）
-if tor_enabled:
-    cfg["outbounds"].append({
-        "type": "socks",
-        "tag": "tor",
-        "server": "127.0.0.1",
-        "server_port": 9050
-    })
-    cfg["route"]["rules"].append({"outbound": "tor", "domain_suffix": ["*.local"]})
-
-# 写入配置文件
-with open("/etc/sing-box/config.json", "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-print("配置文件已生成")
-PY
-
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}配置文件生成失败！${PLAIN}"
-        exit 1
-    fi
+EOF
 }
-
-# ============================================================================
-# Systemd 服务
-# ============================================================================
 
 write_service() {
     cat > "${SERVICE_FILE}" <<EOF
@@ -433,25 +330,21 @@ WantedBy=multi-user.target
 EOF
 }
 
-# ============================================================================
-# 节点信息存储与管理
-# ============================================================================
-
 save_node_meta() {
     mkdir -p "${CONFIG_DIR}"
-    cat > "${NODE_META_FILE}" << EOF
-UUID=${UUID}
-SHORT_ID_4=${SHORT_ID_4}
-SHORT_ID_8=${SHORT_ID_8}
-PRIVATE_KEY=${PRIVATE_KEY}
-PUBLIC_KEY=${PUBLIC_KEY}
-SNI=${DEFAULT_REALITY_SNI}
-REALITY_PORT=${REALITY_PORT}
-HY2_PORT=${HY2_PORT}
-HY2_PASSWORD=${HY2_PASSWORD}
-HY2_SNI=${DEFAULT_HY2_SNI}
-VERSION=${VERSION}
-EOF
+    {
+        printf 'UUID=%q\n' "$UUID"
+        printf 'SHORT_ID_4=%q\n' "$SHORT_ID_4"
+        printf 'SHORT_ID_8=%q\n' "$SHORT_ID_8"
+        printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
+        printf 'PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
+        printf 'SNI=%q\n' "$SNI"
+        printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
+        printf 'HY2_PORT=%q\n' "$HY2_PORT"
+        printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
+        printf 'HY2_SNI=%q\n' "$DEFAULT_HY2_SNI"
+        printf 'VERSION=%q\n' "$VERSION"
+    } > "${NODE_META_FILE}"
     chmod 600 "${NODE_META_FILE}" >/dev/null 2>&1
 }
 
@@ -476,44 +369,28 @@ update_node_meta_field() {
     chmod 600 "${NODE_META_FILE}" >/dev/null 2>&1
 }
 
-# ============================================================================
-# Tor 状态检查
-# ============================================================================
-
 check_tor_status() {
-    if command_exists tor && ss -lnt 2>/dev/null | grep -q ':9050'; then
+    if command_exists ss && ss -lnt 2>/dev/null | grep -q ':9050'; then
         echo -e "${GREEN}==> 检测到 Tor 已在 127.0.0.1:9050 运行。${PLAIN}"
     else
         echo -e "${YELLOW}⚠ 警告：未检测到 Tor 在 127.0.0.1:9050 监听！${PLAIN}"
-        echo -e "${YELLOW}如需启用 Tor 分流，请安装并启动 tor 服务：${PLAIN}"
+        echo -e "${YELLOW}请确保已安装并启动 tor 服务：${PLAIN}"
         echo -e "apt install tor && systemctl enable --now tor"
     fi
 }
-
-# ============================================================================
-# 服务管理
-# ============================================================================
 
 restart_and_enable_service() {
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
     systemctl restart sing-box
 
-    sleep 2
     if ! systemctl is-active --quiet sing-box; then
-        echo -e "${RED}Sing-box 启动失败！${PLAIN}"
-        echo -e "${YELLOW}请执行以下命令排查：${PLAIN}"
+        echo -e "${RED}Sing-box 启动失败，请执行以下命令排查：${PLAIN}"
         echo "systemctl status sing-box --no-pager -l"
         echo "journalctl -u sing-box -n 100 --no-pager"
         exit 1
     fi
-
-    echo -e "${GREEN}==> Sing-box 服务已启动${PLAIN}"
 }
-
-# ============================================================================
-# 节点信息显示与链接生成（核心修复）
-# ============================================================================
 
 render_node_info() {
     local title="${1:-当前节点信息}"
@@ -528,7 +405,6 @@ render_node_info() {
     get_server_ip_and_country 1
     load_node_meta
 
-    # 从配置文件读取信息（确保与运行配置一致）
     local info
     info=$(python3 - <<'PY'
 import json, shlex
@@ -536,12 +412,8 @@ import json, shlex
 def out(key, value):
     print(f"{key}={shlex.quote(str(value))}")
 
-try:
-    with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
-        cfg = json.load(f)
-except Exception as e:
-    print(f"ERROR={e}")
-    exit(1)
+with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 
 reality_port = ''
 uuid = ''
@@ -560,7 +432,6 @@ for inbound in cfg.get('inbounds', []):
         sni = tls.get('server_name', '')
         reality = tls.get('reality', {})
         short_ids = reality.get('short_id', []) or []
-        public_key = reality.get('public_key', '')
     elif inbound.get('tag') == 'hy2-in':
         hy2_port = inbound.get('listen_port', '')
         users = inbound.get('users', [])
@@ -572,89 +443,79 @@ out("UUID", uuid)
 out("SNI", sni)
 out("SHORT_ID_4", short_ids[0] if len(short_ids) > 0 else '')
 out("SHORT_ID_8", short_ids[1] if len(short_ids) > 1 else '')
-out("PUBLIC_KEY", public_key)
 out("HY2_PORT", hy2_port)
 out("HY2_PASSWORD", hy2_password)
 PY
 )
 
-    if [[ $? -ne 0 || -z "$info" || "$info" == *ERROR* ]]; then
+    if [[ $? -ne 0 || -z "$info" ]]; then
         echo -e "${RED}读取节点信息失败，请检查配置文件格式！${PLAIN}"
         [[ "$need_pause" == "1" ]] && pause_back
         return 1
     fi
 
-    eval "$info"
+eval "$info"
 
-    # 从环境变量文件获取 PublicKey（Reality 需要）
-    local public_key="${PUBLIC_KEY:-}"
-    if [[ -z "$public_key" && -f "${NODE_META_FILE}" ]]; then
-        source "${NODE_META_FILE}"
-        public_key="${PUBLIC_KEY:-}"
-    fi
+local sid fp version_display public_key_display vless_link hy2_link
+local fp_list=("chrome" "firefox" "safari" "edge")
 
-    local sid fp version_display public_key_display vless_link hy2_link
-    local fp_list=("chrome" "firefox" "safari" "edge")
+fp=${fp_list[$RANDOM % ${#fp_list[@]}]}
+sid="${SHORT_ID_8:-$SHORT_ID_4}"
+public_key_display="${PUBLIC_KEY:-未记录（旧版安装可能未保存）}"
 
-    fp=${fp_list[$RANDOM % ${#fp_list[@]}]}
-    sid="${SHORT_ID_8:-${SHORT_ID_4}}"
-    public_key_display="${public_key:-未记录}"
+if [[ -x "${BIN_PATH}" ]]; then
+    version_display=$("${BIN_PATH}" version 2>/dev/null | head -n 1)
+fi
+[[ -z "$version_display" && -n "$VERSION" ]] && version_display="$VERSION"
 
-    if [[ -x "${BIN_PATH}" ]]; then
-        version_display=$("${BIN_PATH}" version 2>/dev/null | head -n 1)
-    fi
-    [[ -z "$version_display" && -n "$VERSION" ]] && version_display="$VERSION"
+if [[ -n "$PUBLIC_KEY" ]]; then
+    vless_link="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=${fp}&type=tcp&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${NODE_PREFIX}-Reality"
+else
+    vless_link=""
+fi
 
-    # 生成 Reality 分享链接（使用真实 PublicKey）
-    if [[ -n "$public_key" && -n "$UUID" ]]; then
-        vless_link="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?security=reality&encryption=none&pbk=${public_key}&headerType=none&fp=${fp}&type=tcp&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${NODE_PREFIX}-Reality"
-    else
-        vless_link=""
-    fi
+hy2_link="hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?insecure=1&sni=${DEFAULT_HY2_SNI}#${NODE_PREFIX}-Hysteria2"
 
-    # 生成 Hysteria2 分享链接
-    hy2_link="hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?insecure=1&sni=${DEFAULT_HY2_SNI}#${NODE_PREFIX}-Hysteria2"
+echo -e "\n${GREEN}=================================================${PLAIN}"
+echo -e "${YELLOW} ${title} ${PLAIN}"
+echo -e "${GREEN}=================================================${PLAIN}"
+echo -e "本机 IP : ${SERVER_IP}"
+[[ -n "$version_display" ]] && echo -e "安装版本 : ${version_display}"
 
-    echo -e "\n${GREEN}=================================================${PLAIN}"
-    echo -e "${YELLOW} ${title} ${PLAIN}"
-    echo -e "${GREEN}=================================================${PLAIN}"
-    echo -e "本机 IP : ${SERVER_IP}"
-    [[ -n "$version_display" ]] && echo -e "安装版本 : ${version_display}"
+echo -e "\n${GREEN}--- 节点 1: VLESS-TCP-Reality ---${PLAIN}"
+echo -e "端口 : ${REALITY_PORT} (TCP)"
+echo -e "UUID : ${UUID}"
+echo -e "SNI : ${SNI}"
+echo -e "流控 : xtls-rprx-vision"
+echo -e "Public Key : ${public_key_display}"
+echo -e "Short ID : ${SHORT_ID_4} / ${SHORT_ID_8}"
 
-    echo -e "\n${GREEN}--- 节点 1: VLESS-TCP-Reality ---${PLAIN}"
-    echo -e "端口 : ${REALITY_PORT} (TCP)"
-    echo -e "UUID : ${UUID}"
-    echo -e "SNI : ${SNI}"
-    echo -e "流控 : xtls-rprx-vision"
-    echo -e "Public Key : ${public_key_display}"
-    echo -e "Short ID : ${SHORT_ID_4} / ${SHORT_ID_8}"
-
-    if [[ -n "$vless_link" ]]; then
-        echo -e "${YELLOW}分享链接 :${PLAIN}\n${vless_link}\n"
-        if command_exists qrencode; then
-            echo -e "${YELLOW}扫码导入 :${PLAIN}"
-            qrencode -t ANSIUTF8 "${vless_link}"
-        fi
-    else
-        echo -e "${YELLOW}分享链接 :${PLAIN}"
-        echo -e "${RED}无法生成链接，缺少 PublicKey！${PLAIN}"
-    fi
-
-    echo -e "\n${GREEN}--- 节点 2: Hysteria2 ---${PLAIN}"
-    echo -e "端口 : ${HY2_PORT} (UDP)"
-    echo -e "密码 : ${HY2_PASSWORD}"
-    echo -e "SNI : ${DEFAULT_HY2_SNI}"
-    echo -e "自签证书 : 是 (客户端请开启 insecure)"
-    echo -e "${YELLOW}分享链接 :${PLAIN}\n${hy2_link}\n"
-
+if [[ -n "$vless_link" ]]; then
+    echo -e "${YELLOW}分享链接 :${PLAIN}\n${vless_link}\n"
     if command_exists qrencode; then
         echo -e "${YELLOW}扫码导入 :${PLAIN}"
-        qrencode -t ANSIUTF8 "${hy2_link}"
+        qrencode -t ANSIUTF8 "${vless_link}"
     fi
+else
+    echo -e "${YELLOW}分享链接 :${PLAIN}"
+    echo -e "当前未记录 Public Key，旧版安装无法直接生成 Reality 分享链接。"
+fi
 
-    echo -e "${GREEN}=================================================${PLAIN}\n"
+echo -e "\n${GREEN}--- 节点 2: Hysteria2 ---${PLAIN}"
+echo -e "端口 : ${HY2_PORT} (UDP)"
+echo -e "密码 : ${HY2_PASSWORD}"
+echo -e "SNI : ${DEFAULT_HY2_SNI}"
+echo -e "自签证书 : 是 (客户端请开启 insecure)"
+echo -e "${YELLOW}分享链接 :${PLAIN}\n${hy2_link}\n"
 
-    [[ "$need_pause" == "1" ]] && pause_back
+if command_exists qrencode; then
+    echo -e "${YELLOW}扫码导入 :${PLAIN}"
+    qrenode -t ANSIUTF8 "${hy2_link}"
+fi
+
+echo -e "${GREEN}=================================================${PLAIN}\n"
+
+[[ "$need_pause" == "1" ]] && pause_back
 }
 
 show_links() {
@@ -665,46 +526,22 @@ show_node_info() {
     render_node_info "当前节点信息" 1
 }
 
-# ============================================================================
-# 安装流程（核心修复）
-# ============================================================================
-
 install_singbox() {
     install_dependencies
     get_server_ip_and_country
     detect_arch
     get_singbox_version "$1"
     download_and_install_singbox
-    
-    # 生成密钥和证书
     generate_cert_and_keys
-    
-    # 检查 Tor 状态
-    check_tor_status
-    
-    # 写入配置文件（使用真实凭证）
     write_config
-    
-    # 写入服务文件
     write_service
-    
-    # 保存节点元信息
     save_node_meta
-    
-    # 重启并启用服务
+    check_tor_status
     restart_and_enable_service
-    
-    # 更新防火墙
     update_firewall_tcp_port "" "${REALITY_PORT}"
     ensure_firewall_udp_port "${HY2_PORT}"
-    
-    # 显示节点信息
     show_links
 }
-
-# ============================================================================
-# 卸载流程
-# ============================================================================
 
 uninstall_singbox() {
     echo -e "\n${YELLOW}即将彻底卸载 Sing-box 及其配置文件，此操作不可逆！${PLAIN}"
@@ -763,16 +600,12 @@ PY
     rm -rf "${CONFIG_DIR}"
 
     echo -e "${GREEN}==> 清理残留安装包...${PLAIN}"
-    rm -f "${TMP_TAR}"
+    rm -f "$tmp"
 
     echo -e "\n${GREEN}================================================================${PLAIN}"
     echo -e "${YELLOW}Sing-box 及其所有配置文件已彻底从系统中卸载清除！${PLAIN}"
     echo -e "${GREEN}================================================================${PLAIN}\n"
 }
-
-# ============================================================================
-# 配置修改功能
-# ============================================================================
 
 modify_reality_sni() {
     if [[ ! -f "${CONFIG_FILE}" ]]; then
@@ -791,7 +624,7 @@ try:
         if inbound.get('tag') == 'reality-in':
             print(inbound.get('tls', {}).get('server_name', ''))
             break
-except:
+except Exception:
     pass
 PY
 )
@@ -805,40 +638,68 @@ PY
         return
     fi
 
+    if ! validate_sni "$new_sni"; then
+        echo -e "${RED}无效的域名格式！只能包含字母、数字、点和横杠。${PLAIN}"
+        pause_back
+        return
+    fi
+
+    # Atomic write with backup
+    cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak" 2>/dev/null || true
+
     if ! python3 - "$new_sni" <<'PY'
-import json, sys
+import json, sys, os
 
 new_sni = sys.argv[1]
-with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
-    cfg = json.load(f)
+tmp = '/etc/sing-box/config.json.tmp'
+try:
+    with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
 
-for inbound in cfg.get('inbounds', []):
-    if inbound.get('tag') == 'reality-in':
-        tls = inbound.setdefault('tls', {})
-        tls['server_name'] = new_sni
-        reality = tls.setdefault('reality', {})
-        handshake = reality.setdefault('handshake', {})
-        handshake['server'] = new_sni
-        break
+    found = False
+    for inbound in cfg.get('inbounds', []):
+        if inbound.get('tag') == 'reality-in':
+            # Ensure tls exists
+            tls = inbound.setdefault('tls', {})
+            tls['server_name'] = new_sni
+            # Ensure reality exists
+            reality = tls.setdefault('reality', {})
+            handshake = reality.setdefault('handshake', {})
+            handshake['server'] = new_sni
+            found = True
+            break
 
-with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    if not found:
+        sys.exit(1)
+
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, '/etc/sing-box/config.json')
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
 PY
     then
-        echo -e "${RED}修改失败，请检查配置文件格式。${PLAIN}"
+        echo -e "${GREEN}修改成功！Sing-box 已重启。${PLAIN}"
+        rm -f "${CONFIG_FILE}.bak"
+        systemctl restart sing-box
+
+        if systemctl is-active --quiet sing-box; then
+            echo -e "请在客户端将伪装域名(SNI)改为: ${YELLOW}${new_sni}${PLAIN}"
+        else
+            rm -f "${CONFIG_FILE}.bak"
+            cp "${CONFIG_FILE}.bak" "${CONFIG_FILE}" 2>/dev/null || true
+            echo -e "${RED}启动失败，已回滚到旧配置。请检查域名格式并手动修复。${PLAIN}"
+        fi
+    else
+        rm -f "${CONFIG_FILE}.bak"
+        cp "${CONFIG_FILE}.bak" "${CONFIG_FILE}" 2>/dev/null || true
+        echo -e "${RED}修改失败，已回滚到旧配置！${PLAIN}"
         pause_back
         return
     fi
 
     update_node_meta_field "SNI" "$new_sni"
-    systemctl restart sing-box
-
-    if systemctl is-active --quiet sing-box; then
-        echo -e "${GREEN}修改成功！Sing-box 已重启。${PLAIN}"
-        echo -e "请在客户端将伪装域名(SNI)改为: ${YELLOW}${new_sni}${PLAIN}"
-    else
-        echo -e "${RED}启动失败，请检查域名格式并手动修复配置。${PLAIN}"
-    fi
     pause_back
 }
 
@@ -876,11 +737,9 @@ PY
         read -rp "请输入新的 Reality 端口 (直接回车保持不变): " new_port
         [[ -z "$new_port" ]] && break
         if validate_port "$new_port"; then
-            if ! check_port_in_use "$new_port"; then
-                break
-            fi
+            break
         fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
+        echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
     done
 
     if [[ -z "$new_port" || "$new_port" == "$current_port" ]]; then
@@ -889,43 +748,54 @@ PY
         return
     fi
 
+    # Atomic write with backup
+    cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak" 2>/dev/null || true
+
     if ! python3 - "$new_port" <<'PY'
-import json, sys
+import json, sys, os
 
 port = int(sys.argv[1])
-with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
-    cfg = json.load(f)
+tmp = '/etc/sing-box/config.json.tmp'
+try:
+    with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
 
-for inbound in cfg.get('inbounds', []):
-    if inbound.get('tag') == 'reality-in':
-        inbound['listen_port'] = port
-        break
+    for inbound in cfg.get('inbounds', []):
+        if inbound.get('tag') == 'reality-in':
+            inbound['listen_port'] = port
+            break
 
-with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, '/etc/sing-box/config.json')
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
 PY
     then
-        echo -e "${RED}修改失败，请检查配置文件格式。${PLAIN}"
+        echo -e "${GREEN}修改成功！Sing-box 已重启。${PLAIN}"
+        rm -f "${CONFIG_FILE}.bak"
+        update_firewall_tcp_port "$current_port" "$new_port"
+        update_node_meta_field "REALITY_PORT" "$new_port"
+        systemctl restart sing-box
+
+        if systemctl is-active --quiet sing-box; then
+            echo -e "请在客户端将 Reality 端口改为: ${YELLOW}${new_port}${PLAIN}"
+        else
+            rm -f "${CONFIG_FILE}.bak"
+            cp "${CONFIG_FILE}.bak" "${CONFIG_FILE}" 2>/dev/null || true
+            echo -e "${RED}启动失败，已回滚到旧配置！${PLAIN}"
+        fi
+    else
+        rm -f "${CONFIG_FILE}.bak"
+        cp "${CONFIG_FILE}.bak" "${CONFIG_FILE}" 2>/dev/null || true
+        echo -e "${red}修改失败，已回滚到旧配置！${PLAIN}"
         pause_back
         return
     fi
 
-    update_firewall_tcp_port "$current_port" "$new_port"
-    update_node_meta_field "REALITY_PORT" "$new_port"
-    systemctl restart sing-box
-
-    if systemctl is-active --quiet sing-box; then
-        echo -e "${GREEN}修改成功！Sing-box 已重启。${PLAIN}"
-        echo -e "请在客户端将 Reality 端口改为: ${YELLOW}${new_port}${PLAIN}"
-    else
-        echo -e "${RED}启动失败，请检查端口占用或手动修复配置。${PLAIN}"
-    fi
     pause_back
 }
-
-# ============================================================================
-# Tor 规则管理
-# ============================================================================
 
 manage_tor_rules() {
     if [[ ! -f "${CONFIG_FILE}" ]]; then
@@ -994,9 +864,9 @@ PY
         echo -e " ${GREEN}a.${PLAIN} 添加 Rule Set URL (.srs)"
         echo -e " ${GREEN}d.${PLAIN} 删除 Rule Set (按 tag 名)"
         echo -e " ${GREEN}u.${PLAIN} 强制更新所有 Rule Set 缓存"
-        echo -e " ${GREEN}+.${PLAIN} 添加自定义域名/IP检测站"
-        echo -e " ${GREEN}-.${PLAIN} 删除自定义域名"
-        echo -e " ${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e " ${green}+.${PLAIN} 添加自定义域名/IP检测站"
+        echo -e " ${green}-.${PLAIN} 删除自定义域名"
+        echo -e " ${green}0.${PLAIN} 返回主菜单"
         echo -e "${GREEN}=============================================${PLAIN}"
         read -rp "请选择操作 [a/d/u/+/-/0]: " tor_choice
 
@@ -1082,7 +952,7 @@ PY
                 ;;
             u|U)
                 echo -e "${GREEN}正在强制更新 Rule Set 缓存...${PLAIN}"
-                rm -f "${CACHE_DIR}"/*
+                rm -f "${CACHE_DB}"
                 systemctl restart sing-box
                 echo -e "${GREEN}缓存已清除，Rule Set 将在重启后重新下载。${PLAIN}"
                 pause_back
@@ -1166,29 +1036,29 @@ PY
     done
 }
 
-# ============================================================================
-# 主菜单
-# ============================================================================
-
 main_menu() {
     while true; do
         clear
         echo -e "${GREEN}=================================================${PLAIN}"
         echo -e "${YELLOW} Sing-box Reality + Hysteria2 共存管理脚本 ${PLAIN}"
         echo -e "${GREEN}=================================================${PLAIN}"
-        echo -e " ${GREEN}1.${PLAIN} 安装 Sing-box"
-        echo -e " ${GREEN}2.${PLAIN} 卸载 Sing-box"
-        echo -e " ${GREEN}3.${PLAIN} 修改 Reality SNI (伪装域名)"
-        echo -e " ${GREEN}4.${PLAIN} 修改 Reality 端口"
-        echo -e " ${GREEN}5.${PLAIN} 查看节点信息"
-        echo -e " ${GREEN}6.${PLAIN} 管理 Tor 分流 Rule Set"
-        echo -e " ${GREEN}0.${PLAIN} 退出脚本"
+        echo -e " ${green}1.${plain} 安装 Sing-box"
+        echo -e " ${green}2.${plain} 卸载 Sing-box"
+        echo -e " ${green}3.${plain} 修改 Reality SNI (伪装域名)"
+        echo -e " ${green}4.${plain} 修改 Reality 端口"
+        echo -e " ${green}5.${plain} 查看节点信息"
+        echo -e " ${green}6.${plain} 管理 Tor 分流 Rule Set"
+        echo -e " ${green}0.${plain} 退出脚本"
         echo -e "${GREEN}=================================================${PLAIN}"
         read -rp "请输入数字 [0-6]: " menu_choice
 
         case "$menu_choice" in
             1)
                 echo
+                local cur_ver=""
+                if [[ -x "${BIN_PATH}" ]]; then
+                    cur_ver=$("${BIN_PATH}" version 2>/dev/null | head -n 1)
+                fi
                 read -rp "请输入要安装的版本号 (如 v1.13.0，直接回车安装最新版): " INPUT_VER
                 INPUT_VER=$(echo "$INPUT_VER" | tr -d ' ')
                 install_singbox "$INPUT_VER"
@@ -1221,10 +1091,6 @@ main_menu() {
         esac
     done
 }
-
-# ============================================================================
-# 启动入口
-# ============================================================================
 
 require_root
 main_menu
