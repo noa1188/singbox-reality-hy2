@@ -56,6 +56,11 @@ check_port_in_use() {
         echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
         return 1
     fi
+    # 如果需要显示占用信息，可取消注释以下代码
+    # if ss -lnt 2>/dev/null | grep -q ":${port}"; then
+    #     echo -e "${YELLOW}端口 ${port} 被以下进程占用：${PLAIN}"
+    #     ss -lntp 2>/dev/null | grep ":${port}"
+    # fi
     return 0
 }
 
@@ -254,9 +259,12 @@ generate_cert_and_keys() {
         if validate_port "$REALITY_PORT"; then
             if ! check_port_in_use "$REALITY_PORT"; then
                 break
+            else
+                echo -e "${YELLOW}检测到端口 ${REALITY_PORT} 可能被占用。按 Ctrl+C 可中断，或输入其他端口。${PLAIN}"
             fi
+        else
+            echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
         fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
     done
 
     while true; do
