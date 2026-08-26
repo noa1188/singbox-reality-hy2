@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 
-# ============================================================================
-# Sing-box Reality + Hysteria2 共存管理脚本
-# 修复版本：修复核心配置写入、环境变量传递、端口检测等关键问题
-# ============================================================================
-
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -17,20 +12,15 @@ BIN_PATH="/usr/local/bin/sing-box"
 TMP_TAR="/root/sing-box.tar.gz"
 HY2_CERT="${CONFIG_DIR}/hy2.crt"
 HY2_KEY="${CONFIG_DIR}/hy2.key"
-CACHE_DIR="${CONFIG_DIR}/cache"
-NODE_META_FILE="${CONFIG_DIR}/node-info.env"
+CACHE_DB="${CONFIG_DIR}/cache.db"
+NODE_META_FILE="${CONFIG_DIR}/node-meta.json"
 
 DEFAULT_REALITY_SNI="www.microsoft.com"
-DEFAULT_REALITY_HANDSHAKE_PORT=443
 DEFAULT_HY2_PORT=8443
 DEFAULT_HY2_SNI="bing.com"
 
-# ============================================================================
-# 基础工具函数
-# ============================================================================
-
 validate_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+    [[ "$1" =~ ^[0-9]+$ ]] && (("$1" >= 1 && "$1" <= 65535))
 }
 
 require_root() {
@@ -43,24 +33,6 @@ require_root() {
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
-
-check_port_in_use() {
-    local port="$1"
-    if ss -lnt 2>/dev/null | grep -q ":${port} "; then
-        echo -e "${RED}端口 ${port} 已被占用！${PLAIN}"
-        return 1
-    fi
-    return 0
-}
-
-pause_back() {
-    read -n 1 -s -r -p "按任意键继续..."
-    echo
-}
-
-# ============================================================================
-# 防火墙管理
-# ============================================================================
 
 update_firewall_tcp_port() {
     local old_port="$1"
@@ -99,9 +71,10 @@ remove_firewall_port() {
     fi
 }
 
-# ============================================================================
-# 网络与系统信息
-# ============================================================================
+pause_back() {
+    read -n 1 -s -r -p "按任意键继续..."
+    echo
+}
 
 get_server_ip_and_country() {
     local quiet="${1:-0}"
@@ -136,10 +109,6 @@ get_server_ip_and_country() {
     fi
 }
 
-# ============================================================================
-# 依赖安装与架构检测
-# ============================================================================
-
 install_dependencies() {
     echo -e "${GREEN}==> 安装必要依赖 (curl, openssl, qrencode, tar, wget, python3)...${PLAIN}"
 
@@ -161,18 +130,15 @@ detect_arch() {
     arch=$(uname -m)
 
     case "$arch" in
-        x86_64) SB_ARCH="amd64" ;;
-        aarch64|arm64) SB_ARCH="arm64" ;;
-        *)
-            echo -e "${RED}不支持的架构: ${arch}${PLAIN}"
-            exit 1
-            ;;
+    x86_64) SB_ARCH="amd64" ;;
+    aarch64 | arm64) SB_ARCH="arm64" ;;
+    armv7* | arm) SB_ARCH="arm" ;;
+    *)
+        echo -e "${RED}不支持的架构: ${arch}${PLAIN}"
+        exit 1
+        ;;
     esac
 }
-
-# ============================================================================
-# Sing-box 下载与安装
-# ============================================================================
 
 get_singbox_version() {
     if [[ -n "$1" ]]; then
@@ -180,14 +146,36 @@ get_singbox_version() {
         [[ "$VERSION" != v* ]] && VERSION="v${VERSION}"
         echo -e "${GREEN}==> 使用指定版本: ${VERSION}${PLAIN}"
     else
-        VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-            | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+        VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest |
+            grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ -z "$VERSION" ]]; then
-            echo -e "${YELLOW}获取最新版本号失败，使用备用版本 v1.10.0${PLAIN}"
-            VERSION="v1.10.0"
+            echo -e "${YELLOW}获取最新版本号失败，使用备用版本 v1.10.7${PLAIN}"
+            VERSION="v1.10.7"
         fi
         echo -e "${GREEN}==> 获取到最新版本: ${VERSION}${PLAIN}"
     fi
+
+    # 提取主版本号用于配置兼容判断
+    VERSION_MAJOR=$(echo "$VERSION" | sed -E 's/v([0-9]+)\.[0-9]+\.[0-9]+/
+\1/')
+    VERSION_MINOR=$(echo "$VERSION" | sed -E 's/v[0-9]+\.([0-9]+)\.[0-9]+/
+\1/')
+}
+
+# 检测 Sing-box 配置模式
+get_config_mode() {
+    # v1.10.x: 旧版配置格式
+    # v1.11+: 新版配置格式
+    if [[ -n "$VERSION_MAJOR" && -n "$VERSION_MINOR" ]]; then
+        if ((VERSION_MAJOR >= 1 && VERSION_MINOR >= 11)); then
+            CONFIG_MODE="modern"
+        else
+            CONFIG_MODE="legacy"
+        fi
+    else
+        CONFIG_MODE="modern"
+    fi
+    echo -e "${GREEN}==> 配置模式: ${CONFIG_MODE} (sing-box ${VERSION})${PLAIN}"
 }
 
 download_and_install_singbox() {
@@ -221,50 +209,28 @@ download_and_install_singbox() {
     rm -rf "${TMP_TAR}" "/root/${tar_name}"
 }
 
-# ============================================================================
-# 密钥与证书生成（核心修复）
-# ============================================================================
-
 generate_cert_and_keys() {
-    mkdir -p "${CONFIG_DIR}" "${CACHE_DIR}"
+    mkdir -p "${CONFIG_DIR}"
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
     SHORT_ID_4=$(openssl rand -hex 4)
     SHORT_ID_8=$(openssl rand -hex 8)
-    
-    # 生成 Reality 密钥对
     KEYPAIR=$("${BIN_PATH}" generate reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/PrivateKey/ {print $2}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/PublicKey/ {print $2}')
-    
     SNI="${DEFAULT_REALITY_SNI}"
     HY2_PORT="${DEFAULT_HY2_PORT}"
     HY2_PASSWORD=$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
-    # 交互式端口选择
     while true; do
         read -rp "请输入 Reality 端口（默认 443）: " REALITY_PORT
         REALITY_PORT=${REALITY_PORT:-443}
         if validate_port "$REALITY_PORT"; then
-            if ! check_port_in_use "$REALITY_PORT"; then
-                break
-            fi
+            break
         fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
+        echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
     done
 
-    while true; do
-        read -rp "请输入 Hysteria2 端口（默认 ${DEFAULT_HY2_PORT}）: " HY2_PORT_INPUT
-        HY2_PORT=${HY2_PORT_INPUT:-${DEFAULT_HY2_PORT}}
-        if validate_port "$HY2_PORT"; then
-            if ! check_port_in_use "$HY2_PORT"; then
-                break
-            fi
-        fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
-    done
-
-    # 生成 Hysteria2 证书
     openssl req -x509 -nodes -newkey rsa:2048 \
         -keyout "${HY2_KEY}" \
         -out "${HY2_CERT}" \
@@ -272,77 +238,78 @@ generate_cert_and_keys() {
         -subj "/CN=${DEFAULT_HY2_SNI}" >/dev/null 2>&1
 
     chmod 600 "${HY2_KEY}" "${HY2_CERT}" >/dev/null 2>&1
-
-    echo -e "${GREEN}==> 密钥与证书生成完成${PLAIN}"
 }
 
-# ============================================================================
-# 配置文件写入（核心修复 - 使用真实凭证）
-# ============================================================================
-
 write_config() {
-    # 检测 Tor 状态
-    TOR_ENABLED="false"
+    # 检查 Tor 是否已安装并运行
+    TOR_ENABLED=false
     if command_exists tor && systemctl is-active --quiet tor 2>/dev/null; then
-        TOR_ENABLED="true"
+        TOR_ENABLED=true
         echo -e "${GREEN}==> 检测到 Tor 服务已运行，保留 Tor 出站规则。${PLAIN}"
     else
         echo -e "${YELLOW}⚠ 未检测到 Tor 服务，将移除 Tor 出站规则。${PLAIN}"
     fi
 
-    # 导出所有变量供 Python 使用（关键修复！）
-    export UUID PRIVATE_KEY PUBLIC_KEY SHORT_ID_4 SHORT_ID_8
-    export REALITY_PORT HY2_PORT HY2_PASSWORD
-    export DEFAULT_HY2_SNI DEFAULT_REALITY_SNI TOR_ENABLED
+    # 导出变量供 Python 使用
+    export UUID PRIVATE_KEY SHORT_ID_4 SHORT_ID_8 PUBLIC_KEY SNI REALITY_PORT HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY CONFIG_MODE TOR_ENABLED
 
     python3 <<'PY'
-import json
-import os
+import json, os
 
-# 从环境变量读取真实凭证
+tor_enabled = os.environ.get("TOR_ENABLED", "false").lower() == "true"
+config_mode = os.environ.get("CONFIG_MODE", "modern")
+
+# 从环境变量读取真实值
 uuid = os.environ.get("UUID", "")
 private_key = os.environ.get("PRIVATE_KEY", "")
-public_key = os.environ.get("PUBLIC_KEY", "")
 short_id_4 = os.environ.get("SHORT_ID_4", "")
 short_id_8 = os.environ.get("SHORT_ID_8", "")
 reality_port = int(os.environ.get("REALITY_PORT", "443"))
+sni = os.environ.get("SNI", "www.microsoft.com")
 hy2_port = int(os.environ.get("HY2_PORT", "8443"))
 hy2_password = os.environ.get("HY2_PASSWORD", "")
-hy2_sni = os.environ.get("DEFAULT_HY2_SNI", "bing.com")
-reality_sni = os.environ.get("DEFAULT_REALITY_SNI", "www.microsoft.com")
-tor_enabled = os.environ.get("TOR_ENABLED", "false").lower() == "true"
+hy2_cert = os.environ.get("HY2_CERT", "/etc/sing-box/hy2.crt")
+hy2_key = os.environ.get("HY2_KEY", "/etc/sing-box/hy2.key")
 
-# 构建配置
+# 构建 short_id 列表
+short_ids = []
+if short_id_4:
+    short_ids.append(short_id_4)
+if short_id_8:
+    short_ids.append(short_id_8)
+
+# v1.10.x vs v1.13.x 配置差异
+if config_mode == "legacy":
+    # v1.10.x 旧版配置格式
+    reality_config = {
+        "enabled": True,
+        "handshake": {"server": sni, "server_port": 443},
+        "private_key": private_key,
+        "short_id": short_ids
+    }
+else:
+    # v1.11+ 新版配置格式
+    reality_config = {
+        "enabled": True,
+        "handshake": {"server": sni, "server_port": 443},
+        "private_key": private_key,
+        "short_id": short_ids,
+        "max_early_data": 0
+    }
+
 cfg = {
-    "log": {
-        "level": "warn",
-        "output": True
-    },
+    "log": {"level": "info"},
     "inbounds": [
         {
             "type": "vless",
             "tag": "reality-in",
             "listen": "::",
             "listen_port": reality_port,
-            "users": [
-                {
-                    "uuid": uuid,
-                    "flow": "xtls-rprx-vision"
-                }
-            ],
+            "users": [{"uuid": uuid, "flow": "xtls-rprx-vision"}],
             "tls": {
                 "enabled": True,
-                "server_name": reality_sni,
-                "reality": {
-                    "enabled": True,
-    "handshake": {
-      "server": reality_sni,
-      "server_port": ${DEFAULT_REALITY_HANDSHAKE_PORT}
-                    },
-                    "private_key": private_key,
-                    "public_key": public_key,
-                    "short_id": [short_id_4, short_id_8]
-                }
+                "server_name": sni,
+                "reality": reality_config
             }
         },
         {
@@ -350,46 +317,20 @@ cfg = {
             "tag": "hy2-in",
             "listen": "::",
             "listen_port": hy2_port,
-            "users": [
-                {
-                    "password": hy2_password
-                }
-            ],
+            "users": [{"password": hy2_password}],
             "tls": {
                 "enabled": True,
-                "certificate_path": "/etc/sing-box/hy2.crt",
-                "key_path": "/etc/sing-box/hy2.key"
+                "certificate_path": hy2_cert,
+                "key_path": hy2_key
             }
         }
     ],
     "outbounds": [
-      {"type": "direct", "tag": "direct"},
-      {"type": "block", "tag": "block"},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050}
-    ],
-    "route": {
-      "rule_set": [],
-      "rules": [
-        {"outbound": "tor"
-        {"outbound": "tor"
-        {"outbound": "tor"}
-            {"protocol": "dns", "outbound": "direct"}
-        ]
-    }
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "block"}
+    ]
 }
 
-# 添加 Tor 出站（如果启用）
 if tor_enabled:
     cfg["outbounds"].append({
         "type": "socks",
@@ -398,25 +339,19 @@ if tor_enabled:
         "server_port": 9050
     })
 
-# 写入配置文件
-with open("/etc/sing-box/config.json", "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-print("配置文件已生成")
-PY
-
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}配置文件生成失败！${PLAIN}"
-        exit 1
-    fi
+cfg["route"] = {
+    "rule_set": [],
+    "rules": [{"protocol": "dns", "outbound": "direct"}]
 }
 
-# ============================================================================
-# Systemd 服务
-# ============================================================================
+with open("/etc/sing-box/config.json", "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+print("配置已生成")
+PY
+}
 
 write_service() {
-    cat > "${SERVICE_FILE}" <<EOF
+    cat >"${SERVICE_FILE}" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -434,96 +369,75 @@ WantedBy=multi-user.target
 EOF
 }
 
-# ============================================================================
-# 节点信息存储与管理
-# ============================================================================
-
 save_node_meta() {
     mkdir -p "${CONFIG_DIR}"
-    {
-      printf 'UUID=%q\n' "$UUID"
-      printf 'SHORT_ID_4=%q\n' "$SHORT_ID_4"
-      printf 'SHORT_ID_8=%q\n' "$SHORT_ID_8"
-      printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
-      printf 'PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
-      printf 'SNI=%q\n' "$SNI"
-      printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
-      printf 'HY2_PORT=%q\n' "$HY2_PORT"
-      printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
-      printf 'HY2_SNI=%q\n' "$DEFAULT_HY2_SNI"
-      printf 'VERSION=%q\n' "$VERSION"
-        printf 'SHORT_ID_8=%q\n' "$SHORT_ID_8"
-        printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
-        printf 'PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
-        printf 'SNI=%q\n' "$SNI"
-        printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
-        printf 'HY2_PORT=%q\n' "$HY2_PORT"
-        printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
-        printf 'HY2_SNI=%q\n' "$DEFAULT_HY2_SNI"
-        printf 'VERSION=%q\n' "$VERSION"
-    } > "${NODE_META_FILE}"
+    python3 <<PY
+import json
+meta = {
+    "UUID": "$UUID",
+    "SHORT_ID_4": "$SHORT_ID_4",
+    "SHORT_ID_8": "$SHORT_ID_8",
+    "PRIVATE_KEY": "$PRIVATE_KEY",
+    "PUBLIC_KEY": "$PUBLIC_KEY",
+    "SNI": "$SNI",
+    "REALITY_PORT": $REALITY_PORT,
+    "HY2_PORT": $HY2_PORT,
+    "HY2_PASSWORD": "$HY2_PASSWORD",
+    "HY2_SNI": "$DEFAULT_HY2_SNI",
+    "VERSION": "$VERSION"
+}
+with open("${NODE_META_FILE}", "w") as f:
+    json.dump(meta, f, indent=2)
+PY
     chmod 600 "${NODE_META_FILE}" >/dev/null 2>&1
 }
 
 load_node_meta() {
     if [[ -f "${NODE_META_FILE}" ]]; then
         # shellcheck disable=SC1090
-        source "${NODE_META_FILE}"
+        source <(python3 -c "import json; meta=json.load(open('${NODE_META_FILE}')); print(' '.join(f'export {k}=\"{v}\"' for k,v in meta.items()))")
     fi
 }
 
 update_node_meta_field() {
     local key="$1"
     local value="$2"
-    local tmp_file="${NODE_META_FILE}.tmp"
 
-    mkdir -p "${CONFIG_DIR}"
-    touch "${NODE_META_FILE}"
-
-    grep -v "^${key}=" "${NODE_META_FILE}" > "${tmp_file}" 2>/dev/null || true
-    printf '%s=%q\n' "$key" "$value" >> "${tmp_file}"
-    mv "${tmp_file}" "${NODE_META_FILE}"
+    python3 - "$key" "$value" <<'PY'
+import json, sys
+key = sys.argv[1]
+value = sys.argv[2]
+with open("${NODE_META_FILE}", "r") as f:
+    meta = json.load(f)
+meta[key] = value
+with open("${NODE_META_FILE}", "w") as f:
+    json.dump(meta, f, indent=2)
+PY
     chmod 600 "${NODE_META_FILE}" >/dev/null 2>&1
 }
 
-# ============================================================================
-# Tor 状态检查
-# ============================================================================
-
 check_tor_status() {
-    if command_exists tor && ss -lnt 2>/dev/null | grep -q ':9050'; then
+    if command_exists ss && ss -lnt 2>/dev/null | grep -q ':9050'; then
         echo -e "${GREEN}==> 检测到 Tor 已在 127.0.0.1:9050 运行。${PLAIN}"
     else
         echo -e "${YELLOW}⚠ 警告：未检测到 Tor 在 127.0.0.1:9050 监听！${PLAIN}"
-        echo -e "${YELLOW}如需启用 Tor 分流，请安装并启动 tor 服务：${PLAIN}"
+        echo -e "${YELLOW}请确保已安装并启动 tor 服务：${PLAIN}"
         echo -e "apt install tor && systemctl enable --now tor"
     fi
 }
-
-# ============================================================================
-# 服务管理
-# ============================================================================
 
 restart_and_enable_service() {
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
     systemctl restart sing-box
 
-    sleep 2
     if ! systemctl is-active --quiet sing-box; then
-        echo -e "${RED}Sing-box 启动失败！${PLAIN}"
-        echo -e "${YELLOW}请执行以下命令排查：${PLAIN}"
+        echo -e "${RED}Sing-box 启动失败，请执行以下命令排查：${PLAIN}"
         echo "systemctl status sing-box --no-pager -l"
         echo "journalctl -u sing-box -n 100 --no-pager"
         exit 1
     fi
-
-    echo -e "${GREEN}==> Sing-box 服务已启动${PLAIN}"
 }
-
-# ============================================================================
-# 节点信息显示与链接生成（核心修复）
-# ============================================================================
 
 render_node_info() {
     local title="${1:-当前节点信息}"
@@ -538,20 +452,16 @@ render_node_info() {
     get_server_ip_and_country 1
     load_node_meta
 
-    # 从配置文件读取信息（确保与运行配置一致）
     local info
-    info=$(python3 - <<'PY'
+    info=$(
+        python3 - <<'PY'
 import json, shlex
 
 def out(key, value):
     print(f"{key}={shlex.quote(str(value))}")
 
-try:
-    with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
-        cfg = json.load(f)
-except Exception as e:
-    print(f"ERROR={e}")
-    exit(1)
+with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 
 reality_port = ''
 uuid = ''
@@ -584,9 +494,9 @@ out("SHORT_ID_8", short_ids[1] if len(short_ids) > 1 else '')
 out("HY2_PORT", hy2_port)
 out("HY2_PASSWORD", hy2_password)
 PY
-)
+    )
 
-    if [[ $? -ne 0 || -z "$info" || "$info" == *ERROR* ]]; then
+    if [[ $? -ne 0 || -z "$info" ]]; then
         echo -e "${RED}读取节点信息失败，请检查配置文件格式！${PLAIN}"
         [[ "$need_pause" == "1" ]] && pause_back
         return 1
@@ -594,33 +504,24 @@ PY
 
     eval "$info"
 
-    # 从环境变量文件获取 PublicKey（Reality 需要）
-    local public_key="${PUBLIC_KEY:-}"
-    if [[ -z "$public_key" && -f "${NODE_META_FILE}" ]]; then
-        source "${NODE_META_FILE}"
-        public_key="${PUBLIC_KEY:-}"
-    fi
-
     local sid fp version_display public_key_display vless_link hy2_link
     local fp_list=("chrome" "firefox" "safari" "edge")
 
     fp=${fp_list[$RANDOM % ${#fp_list[@]}]}
-    sid="${SHORT_ID_8:-${SHORT_ID_4}}"
-    public_key_display="${public_key:-未记录}"
+    sid="${SHORT_ID_8:-$SHORT_ID_4}"
+    public_key_display="${PUBLIC_KEY:-未记录（旧版安装可能未保存）}"
 
     if [[ -x "${BIN_PATH}" ]]; then
         version_display=$("${BIN_PATH}" version 2>/dev/null | head -n 1)
     fi
     [[ -z "$version_display" && -n "$VERSION" ]] && version_display="$VERSION"
 
-    # 生成 Reality 分享链接（使用真实 PublicKey）
-    if [[ -n "$public_key" && -n "$uuid" ]]; then
-        vless_link="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?security=reality&encryption=none&pbk=${public_key}&headerType=none&fp=${fp}&type=tcp&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${NODE_PREFIX}-Reality"
+    if [[ -n "$PUBLIC_KEY" ]]; then
+        vless_link="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=${fp}&type=tcp&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${NODE_PREFIX}-Reality"
     else
         vless_link=""
     fi
 
-    # 生成 Hysteria2 分享链接
     hy2_link="hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?insecure=1&sni=${DEFAULT_HY2_SNI}#${NODE_PREFIX}-Hysteria2"
 
     echo -e "\n${GREEN}=================================================${PLAIN}"
@@ -645,7 +546,7 @@ PY
         fi
     else
         echo -e "${YELLOW}分享链接 :${PLAIN}"
-        echo -e "${RED}无法生成链接，缺少 PublicKey！${PLAIN}"
+        echo -e "当前未记录 Public Key，旧版安装无法直接生成 Reality 分享链接。"
     fi
 
     echo -e "\n${GREEN}--- 节点 2: Hysteria2 ---${PLAIN}"
@@ -673,46 +574,23 @@ show_node_info() {
     render_node_info "当前节点信息" 1
 }
 
-# ============================================================================
-# 安装流程（核心修复）
-# ============================================================================
-
 install_singbox() {
     install_dependencies
     get_server_ip_and_country
     detect_arch
     get_singbox_version "$1"
+    get_config_mode
     download_and_install_singbox
-    
-    # 生成密钥和证书
     generate_cert_and_keys
-    
-    # 检查 Tor 状态
-    check_tor_status
-    
-    # 写入配置文件（使用真实凭证）
     write_config
-    
-    # 写入服务文件
     write_service
-    
-    # 保存节点元信息
     save_node_meta
-    
-    # 重启并启用服务
+    check_tor_status
     restart_and_enable_service
-    
-    # 更新防火墙
     update_firewall_tcp_port "" "${REALITY_PORT}"
     ensure_firewall_udp_port "${HY2_PORT}"
-    
-    # 显示节点信息
     show_links
 }
-
-# ============================================================================
-# 卸载流程
-# ============================================================================
 
 uninstall_singbox() {
     echo -e "\n${YELLOW}即将彻底卸载 Sing-box 及其配置文件，此操作不可逆！${PLAIN}"
@@ -724,7 +602,8 @@ uninstall_singbox() {
 
     local reality_port hy2_port
     if [[ -f "${CONFIG_FILE}" ]]; then
-        reality_port=$(python3 - <<'PY'
+        reality_port=$(
+            python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -736,8 +615,9 @@ try:
 except:
     pass
 PY
-)
-        hy2_port=$(python3 - <<'PY'
+        )
+        hy2_port=$(
+            python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -749,7 +629,7 @@ try:
 except:
     pass
 PY
-)
+        )
     fi
 
     if systemctl list-unit-files | grep -q '^sing-box\.service'; then
@@ -778,10 +658,6 @@ PY
     echo -e "${GREEN}================================================================${PLAIN}\n"
 }
 
-# ============================================================================
-# 配置修改功能
-# ============================================================================
-
 modify_reality_sni() {
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         echo -e "${RED}错误：未找到 Sing-box 配置文件，请先安装！${PLAIN}"
@@ -790,7 +666,8 @@ modify_reality_sni() {
     fi
 
     local current_sni new_sni
-    current_sni=$(python3 - <<'PY'
+    current_sni=$(
+        python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -802,7 +679,7 @@ try:
 except:
     pass
 PY
-)
+    )
 
     echo -e "当前 Reality SNI 为: ${GREEN}${current_sni}${PLAIN}"
     read -rp "请输入新的 SNI (直接回车保持不变): " new_sni
@@ -813,7 +690,7 @@ PY
         return
     fi
 
-    if ! python3 - "$new_sni" <<'PY'
+    if ! python3 - "$new_sni" <<'PY'; then
 import json, sys
 
 new_sni = sys.argv[1]
@@ -832,7 +709,6 @@ for inbound in cfg.get('inbounds', []):
 with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 PY
-    then
         echo -e "${RED}修改失败，请检查配置文件格式。${PLAIN}"
         pause_back
         return
@@ -858,7 +734,8 @@ modify_reality_port() {
     fi
 
     local current_port new_port
-    current_port=$(python3 - <<'PY'
+    current_port=$(
+        python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -870,7 +747,7 @@ try:
 except:
     pass
 PY
-)
+    )
 
     if [[ -z "$current_port" ]]; then
         echo -e "${RED}读取当前 Reality 端口失败，请检查配置文件。${PLAIN}"
@@ -884,11 +761,9 @@ PY
         read -rp "请输入新的 Reality 端口 (直接回车保持不变): " new_port
         [[ -z "$new_port" ]] && break
         if validate_port "$new_port"; then
-            if ! check_port_in_use "$new_port"; then
-                break
-            fi
+            break
         fi
-        echo -e "${RED}端口无效或已被占用，请输入 1-65535 之间的数字！${PLAIN}"
+        echo -e "${RED}端口无效，请输入 1-65535 之间的数字！${PLAIN}"
     done
 
     if [[ -z "$new_port" || "$new_port" == "$current_port" ]]; then
@@ -897,7 +772,7 @@ PY
         return
     fi
 
-    if ! python3 - "$new_port" <<'PY'
+    if ! python3 - "$new_port" <<'PY'; then
 import json, sys
 
 port = int(sys.argv[1])
@@ -912,7 +787,6 @@ for inbound in cfg.get('inbounds', []):
 with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 PY
-    then
         echo -e "${RED}修改失败，请检查配置文件格式。${PLAIN}"
         pause_back
         return
@@ -931,10 +805,6 @@ PY
     pause_back
 }
 
-# ============================================================================
-# Tor 规则管理
-# ============================================================================
-
 manage_tor_rules() {
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         echo -e "${RED}错误：未找到 Sing-box 配置文件，请先安装！${PLAIN}"
@@ -952,7 +822,8 @@ manage_tor_rules() {
         echo -e " https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs"
         echo -e "${GREEN}=============================================${PLAIN}"
 
-        CURRENT_RULESETS=$(python3 - <<'PY'
+        CURRENT_RULESETS=$(
+            python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -969,7 +840,7 @@ try:
 except:
     pass
 PY
-)
+        )
 
         if [[ -n "$CURRENT_RULESETS" ]]; then
             echo -e "${GREEN}当前 Tor Rule Set 列表：${PLAIN}"
@@ -979,7 +850,8 @@ PY
             echo -e "${YELLOW}当前暂无 Tor Rule Set。${PLAIN}"
         fi
 
-        CURRENT_DOMAINS=$(python3 - <<'PY'
+        CURRENT_DOMAINS=$(
+            python3 - <<'PY'
 import json
 try:
     with open('/etc/sing-box/config.json', 'r', encoding='utf-8') as f:
@@ -991,7 +863,7 @@ try:
 except:
     pass
 PY
-)
+        )
 
         if [[ -n "$CURRENT_DOMAINS" ]]; then
             echo -e "${GREEN}自定义域名列表：${PLAIN}"
@@ -1009,14 +881,14 @@ PY
         read -rp "请选择操作 [a/d/u/+/-/0]: " tor_choice
 
         case "$tor_choice" in
-            a|A)
-                read -rp "请输入 .srs Rule Set URL: " NEW_URL
-                NEW_URL=$(echo "$NEW_URL" | tr -d ' ')
-                if [[ -z "$NEW_URL" || "$NEW_URL" != *.srs ]]; then
-                    echo -e "${RED}URL 无效，须以 .srs 结尾。${PLAIN}"
-                else
-                    NEW_TAG=$(basename "$NEW_URL" .srs)
-                    if python3 - "$NEW_URL" "$NEW_TAG" <<'PY'
+        a | A)
+            read -rp "请输入 .srs Rule Set URL: " NEW_URL
+            NEW_URL=$(echo "$NEW_URL" | tr -d ' ')
+            if [[ -z "$NEW_URL" || "$NEW_URL" != *.srs ]]; then
+                echo -e "${RED}URL 无效，须以 .srs 结尾。${PLAIN}"
+            else
+                NEW_TAG=$(basename "$NEW_URL" .srs)
+                if python3 - "$NEW_URL" "$NEW_TAG" <<'PY'; then
 import json, sys
 
 url, tag = sys.argv[1], sys.argv[2]
@@ -1047,22 +919,21 @@ if tag not in tor_rule.setdefault('rule_set', []):
 with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 PY
-                    then
-                        systemctl restart sing-box
-                        echo -e "${GREEN}已添加 Rule Set [${NEW_TAG}] 并重启服务。${PLAIN}"
-                    else
-                        echo -e "${RED}添加失败，请检查配置文件格式。${PLAIN}"
-                    fi
-                fi
-                pause_back
-                ;;
-            d|D)
-                read -rp "请输入要删除的 Rule Set tag (如 geosite-twitter): " DEL_TAG
-                DEL_TAG=$(echo "$DEL_TAG" | tr -d ' ')
-                if [[ -z "$DEL_TAG" ]]; then
-                    echo -e "${YELLOW}tag 不能为空，已取消。${PLAIN}"
+                    systemctl restart sing-box
+                    echo -e "${GREEN}已添加 Rule Set [${NEW_TAG}] 并重启服务。${PLAIN}"
                 else
-                    if python3 - "$DEL_TAG" <<'PY'
+                    echo -e "${RED}添加失败，请检查配置文件格式。${PLAIN}"
+                fi
+            fi
+            pause_back
+            ;;
+        d | D)
+            read -rp "请输入要删除的 Rule Set tag (如 geosite-twitter): " DEL_TAG
+            DEL_TAG=$(echo "$DEL_TAG" | tr -d ' ')
+            if [[ -z "$DEL_TAG" ]]; then
+                echo -e "${YELLOW}tag 不能为空，已取消。${PLAIN}"
+            else
+                if python3 - "$DEL_TAG" <<'PY'; then
 import json, sys
 
 tag = sys.argv[1]
@@ -1079,29 +950,28 @@ for r in route.get('rules', []):
 with open('/etc/sing-box/config.json', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 PY
-                    then
-                        systemctl restart sing-box
-                        echo -e "${GREEN}已删除 Rule Set [${DEL_TAG}] 并重启服务。${PLAIN}"
-                    else
-                        echo -e "${RED}删除失败。${PLAIN}"
-                    fi
-                fi
-                pause_back
-                ;;
-            u|U)
-                echo -e "${GREEN}正在强制更新 Rule Set 缓存...${PLAIN}"
-                rm -f "${CACHE_DIR}"/*
-                systemctl restart sing-box
-                echo -e "${GREEN}缓存已清除，Rule Set 将在重启后重新下载。${PLAIN}"
-                pause_back
-                ;;
-            "+")
-                read -rp "请输入要添加的域名 (如 ip.sb / ipinfo.io): " ADD_DOMAIN
-                ADD_DOMAIN=$(echo "$ADD_DOMAIN" | tr -d ' ')
-                if [[ -z "$ADD_DOMAIN" ]]; then
-                    echo -e "${YELLOW}输入为空，已取消。${PLAIN}"
+                    systemctl restart sing-box
+                    echo -e "${GREEN}已删除 Rule Set [${DEL_TAG}] 并重启服务。${PLAIN}"
                 else
-                    if python3 - "$ADD_DOMAIN" <<'PY'
+                    echo -e "${RED}删除失败。${PLAIN}"
+                fi
+            fi
+            pause_back
+            ;;
+        u | U)
+            echo -e "${GREEN}正在强制更新 Rule Set 缓存...${PLAIN}"
+            rm -f "${CACHE_DB}"
+            systemctl restart sing-box
+            echo -e "${GREEN}缓存已清除，Rule Set 将在重启后重新下载。${PLAIN}"
+            pause_back
+            ;;
+        "+")
+            read -rp "请输入要添加的域名 (如 ip.sb / ipinfo.io): " ADD_DOMAIN
+            ADD_DOMAIN=$(echo "$ADD_DOMAIN" | tr -d ' ')
+            if [[ -z "$ADD_DOMAIN" ]]; then
+                echo -e "${YELLOW}输入为空，已取消。${PLAIN}"
+            else
+                if python3 - "$ADD_DOMAIN" <<'PY'; then
 import json, sys
 
 domain = sys.argv[1]
@@ -1122,22 +992,21 @@ if domain not in ds_rule['domain_suffix']:
 else:
     raise SystemExit(1)
 PY
-                    then
-                        systemctl restart sing-box
-                        echo -e "${GREEN}已添加 [${ADD_DOMAIN}] 并重启服务。${PLAIN}"
-                    else
-                        echo -e "${YELLOW}该域名已存在，无需重复添加。${PLAIN}"
-                    fi
-                fi
-                pause_back
-                ;;
-            "-")
-                read -rp "请输入要删除的域名: " RM_DOMAIN
-                RM_DOMAIN=$(echo "$RM_DOMAIN" | tr -d ' ')
-                if [[ -z "$RM_DOMAIN" ]]; then
-                    echo -e "${YELLOW}输入为空，已取消。${PLAIN}"
+                    systemctl restart sing-box
+                    echo -e "${GREEN}已添加 [${ADD_DOMAIN}] 并重启服务。${PLAIN}"
                 else
-                    if python3 - "$RM_DOMAIN" <<'PY'
+                    echo -e "${YELLOW}该域名已存在，无需重复添加。${PLAIN}"
+                fi
+            fi
+            pause_back
+            ;;
+        "-")
+            read -rp "请输入要删除的域名: " RM_DOMAIN
+            RM_DOMAIN=$(echo "$RM_DOMAIN" | tr -d ' ')
+            if [[ -z "$RM_DOMAIN" ]]; then
+                echo -e "${YELLOW}输入为空，已取消。${PLAIN}"
+            else
+                if python3 - "$RM_DOMAIN" <<'PY'; then
 import json, sys
 
 domain = sys.argv[1]
@@ -1154,29 +1023,24 @@ if ds_rule and domain in ds_rule.get('domain_suffix', []):
 else:
     raise SystemExit(1)
 PY
-                    then
-                        systemctl restart sing-box
-                        echo -e "${GREEN}已删除 [${RM_DOMAIN}] 并重启服务。${PLAIN}"
-                    else
-                        echo -e "${YELLOW}未找到该域名，请检查输入。${PLAIN}"
-                    fi
+                    systemctl restart sing-box
+                    echo -e "${GREEN}已删除 [${RM_DOMAIN}] 并重启服务。${PLAIN}"
+                else
+                    echo -e "${YELLOW}未找到该域名，请检查输入。${PLAIN}"
                 fi
-                pause_back
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效输入！${PLAIN}"
-                pause_back
-                ;;
+            fi
+            pause_back
+            ;;
+        0)
+            break
+            ;;
+        *)
+            echo -e "${RED}无效输入！${PLAIN}"
+            pause_back
+            ;;
         esac
     done
 }
-
-# ============================================================================
-# 主菜单
-# ============================================================================
 
 main_menu() {
     while true; do
@@ -1195,44 +1059,40 @@ main_menu() {
         read -rp "请输入数字 [0-6]: " menu_choice
 
         case "$menu_choice" in
-            1)
-                echo
-                read -rp "请输入要安装的版本号 (如 v1.13.0，直接回车安装最新版): " INPUT_VER
-                INPUT_VER=$(echo "$INPUT_VER" | tr -d ' ')
-                install_singbox "$INPUT_VER"
-                pause_back
-                ;;
-            2)
-                uninstall_singbox
-                pause_back
-                ;;
-            3)
-                modify_reality_sni
-                ;;
-            4)
-                modify_reality_port
-                ;;
-            5)
-                show_node_info
-                ;;
-            6)
-                manage_tor_rules
-                ;;
-            0)
-                echo -e "${GREEN}退出脚本。${PLAIN}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}请输入正确的数字！${PLAIN}"
-                pause_back
-                ;;
+        1)
+            echo
+            read -rp "请输入要安装的版本号 (如 v1.13.0，直接回车安装最新版): " INPUT_VER
+            INPUT_VER=$(echo "$INPUT_VER" | tr -d ' ')
+            install_singbox "$INPUT_VER"
+            pause_back
+            ;;
+        2)
+            uninstall_singbox
+            pause_back
+            ;;
+        3)
+            modify_reality_sni
+            ;;
+        4)
+            modify_reality_port
+            ;;
+        5)
+            show_node_info
+            ;;
+        6)
+            manage_tor_rules
+            ;;
+        0)
+            echo -e "${GREEN}退出脚本。${PLAIN}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}请输入正确的数字！${PLAIN}"
+            pause_back
+            ;;
         esac
     done
 }
-
-# ============================================================================
-# 启动入口
-# ============================================================================
 
 require_root
 main_menu
