@@ -311,6 +311,7 @@ hy2_password = os.environ.get("HY2_PASSWORD", "")
 hy2_sni = os.environ.get("DEFAULT_HY2_SNI", "bing.com")
 reality_sni = os.environ.get("DEFAULT_REALITY_SNI", "www.microsoft.com")
 tor_enabled = os.environ.get("TOR_ENABLED", "false").lower() == "true"
+handshake_port = int(os.environ.get("HANDSHAKE_PORT", "443"))
 
 # 构建配置
 cfg = {
@@ -335,9 +336,9 @@ cfg = {
                 "server_name": reality_sni,
                 "reality": {
                     "enabled": True,
-    "handshake": {
-      "server": reality_sni,
-      "server_port": ${DEFAULT_REALITY_HANDSHAKE_PORT}
+                    "handshake": {
+                        "server": reality_sni,
+                        "server_port": handshake_port
                     },
                     "private_key": private_key,
                     "public_key": public_key,
@@ -363,29 +364,12 @@ cfg = {
         }
     ],
     "outbounds": [
-      {"type": "direct", "tag": "direct"},
-      {"type": "block", "tag": "block"},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050},
-      {"type": "socks", "tag": "tor",
-       "server": "127.0.0.1",
-       "server_port": 9050}
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "block"}
     ],
     "route": {
-      "rule_set": [],
-      "rules": [
-        {"outbound": "tor"
-        {"outbound": "tor"
-        {"outbound": "tor"}
-            {"protocol": "dns", "outbound": "direct"}
-        ]
+        "rule_set": [],
+        "rules": []
     }
 }
 
@@ -397,6 +381,7 @@ if tor_enabled:
         "server": "127.0.0.1",
         "server_port": 9050
     })
+    cfg["route"]["rules"].append({"outbound": "tor", "domain_suffix": ["*.local"]})
 
 # 写入配置文件
 with open("/etc/sing-box/config.json", "w", encoding="utf-8") as f:
@@ -440,28 +425,19 @@ EOF
 
 save_node_meta() {
     mkdir -p "${CONFIG_DIR}"
-    {
-      printf 'UUID=%q\n' "$UUID"
-      printf 'SHORT_ID_4=%q\n' "$SHORT_ID_4"
-      printf 'SHORT_ID_8=%q\n' "$SHORT_ID_8"
-      printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
-      printf 'PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
-      printf 'SNI=%q\n' "$SNI"
-      printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
-      printf 'HY2_PORT=%q\n' "$HY2_PORT"
-      printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
-      printf 'HY2_SNI=%q\n' "$DEFAULT_HY2_SNI"
-      printf 'VERSION=%q\n' "$VERSION"
-        printf 'SHORT_ID_8=%q\n' "$SHORT_ID_8"
-        printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
-        printf 'PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
-        printf 'SNI=%q\n' "$SNI"
-        printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
-        printf 'HY2_PORT=%q\n' "$HY2_PORT"
-        printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
-        printf 'HY2_SNI=%q\n' "$DEFAULT_HY2_SNI"
-        printf 'VERSION=%q\n' "$VERSION"
-    } > "${NODE_META_FILE}"
+    cat > "${NODE_META_FILE}" << EOF
+UUID=${UUID}
+SHORT_ID_4=${SHORT_ID_4}
+SHORT_ID_8=${SHORT_ID_8}
+PRIVATE_KEY=${PRIVATE_KEY}
+PUBLIC_KEY=${PUBLIC_KEY}
+SNI=${DEFAULT_REALITY_SNI}
+REALITY_PORT=${REALITY_PORT}
+HY2_PORT=${HY2_PORT}
+HY2_PASSWORD=${HY2_PASSWORD}
+HY2_SNI=${DEFAULT_HY2_SNI}
+VERSION=${VERSION}
+EOF
     chmod 600 "${NODE_META_FILE}" >/dev/null 2>&1
 }
 
@@ -570,6 +546,7 @@ for inbound in cfg.get('inbounds', []):
         sni = tls.get('server_name', '')
         reality = tls.get('reality', {})
         short_ids = reality.get('short_id', []) or []
+        public_key = reality.get('public_key', '')
     elif inbound.get('tag') == 'hy2-in':
         hy2_port = inbound.get('listen_port', '')
         users = inbound.get('users', [])
@@ -581,6 +558,7 @@ out("UUID", uuid)
 out("SNI", sni)
 out("SHORT_ID_4", short_ids[0] if len(short_ids) > 0 else '')
 out("SHORT_ID_8", short_ids[1] if len(short_ids) > 1 else '')
+out("PUBLIC_KEY", public_key)
 out("HY2_PORT", hy2_port)
 out("HY2_PASSWORD", hy2_password)
 PY
@@ -614,7 +592,7 @@ PY
     [[ -z "$version_display" && -n "$VERSION" ]] && version_display="$VERSION"
 
     # 生成 Reality 分享链接（使用真实 PublicKey）
-    if [[ -n "$public_key" && -n "$uuid" ]]; then
+    if [[ -n "$public_key" && -n "$UUID" ]]; then
         vless_link="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?security=reality&encryption=none&pbk=${public_key}&headerType=none&fp=${fp}&type=tcp&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${NODE_PREFIX}-Reality"
     else
         vless_link=""
